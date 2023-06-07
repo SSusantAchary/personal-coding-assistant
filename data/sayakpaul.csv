@@ -1,0 +1,2176 @@
+,reponame,filepath,content
+0,sayakpaul/CI-CD-for-Model-Training,cloud_build_tfx.ipynb,"from google.colab import auth
+auth.authenticate_user()GOOGLE_CLOUD_PROJECT = ""fast-ai-exploration""
+GOOGLE_CLOUD_REGION = ""us-central1""
+GCS_BUCKET_NAME = ""vertex-tfx-mlops""
+
+PIPELINE_NAME = ""penguin-vertex-training""
+DATA_ROOT = ""gs://{}/data/{}"".format(GCS_BUCKET_NAME, PIPELINE_NAME)
+MODULE_ROOT = ""gs://{}/pipeline_module/{}"".format(GCS_BUCKET_NAME, PIPELINE_NAME)
+
+if not (GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_REGION and GCS_BUCKET_NAME):
+    from absl import logging
+
+    logging.error(""Please set all required parameters."")_trainer_module_file = 'penguin_trainer.py'%%writefile {_trainer_module_file}
+
+# Copied from https://www.tensorflow.org/tfx/tutorials/tfx/penguin_simple and
+# slightly modified run_fn() to add distribution_strategy.
+
+from typing import List
+from absl import logging
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow_metadata.proto.v0 import schema_pb2
+from tensorflow_transform.tf_metadata import schema_utils
+
+from tfx import v1 as tfx
+from tfx_bsl.public import tfxio
+
+_FEATURE_KEYS = [
+    ""culmen_length_mm"",
+    ""culmen_depth_mm"",
+    ""flipper_length_mm"",
+    ""body_mass_g"",
+]
+_LABEL_KEY = ""species""
+
+_TRAIN_BATCH_SIZE = 20
+_EVAL_BATCH_SIZE = 10
+
+# Since we're not generating or creating a schema, we will instead create
+# a feature spec.  Since there are a fairly small number of features this is
+# manageable for this dataset.
+_FEATURE_SPEC = {
+    **{
+        feature: tf.io.FixedLenFeature(shape=[1], dtype=tf.float32)
+        for feature in _FEATURE_KEYS
+    },
+    _LABEL_KEY: tf.io.FixedLenFeature(shape=[1], dtype=tf.int64),
+}
+
+
+def _input_fn(
+    file_pattern: List[str],
+    data_accessor: tfx.components.DataAccessor,
+    schema: schema_pb2.Schema,
+    batch_size: int,
+) -> tf.data.Dataset:
+    """"""Generates features and label for training.
+
+    Args:
+      file_pattern: List of paths or patterns of input tfrecord files.
+      data_accessor: DataAccessor for converting input to RecordBatch.
+      schema: schema of the input data.
+      batch_size: representing the number of consecutive elements of returned
+        dataset to combine in a single batch
+
+    Returns:
+      A dataset that contains (features, indices) tuple where features is a
+        dictionary of Tensors, and indices is a single Tensor of label indices.
+    """"""
+    return data_accessor.tf_dataset_factory(
+        file_pattern,
+        tfxio.TensorFlowDatasetOptions(batch_size=batch_size, label_key=_LABEL_KEY),
+        schema=schema,
+    ).repeat()
+
+
+def _make_keras_model(learning_rate: float) -> tf.keras.Model:
+    """"""Creates a DNN Keras model for classifying penguin data.
+
+    Returns:
+      A Keras Model.
+    """"""
+    # The model below is built with Functional API, please refer to
+    # https://www.tensorflow.org/guide/keras/overview for all API options.
+    inputs = [keras.layers.Input(shape=(1,), name=f) for f in _FEATURE_KEYS]
+    d = keras.layers.concatenate(inputs)
+    for _ in range(2):
+        d = keras.layers.Dense(8, activation=""relu"")(d)
+    outputs = keras.layers.Dense(3)(d)
+
+    model = keras.Model(inputs=inputs, outputs=outputs)
+    optimizer = keras.optimizers.Adam(learning_rate)
+    model.compile(
+        optimizer=optimizer,
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=[keras.metrics.SparseCategoricalAccuracy()],
+    )
+
+    model.summary(print_fn=logging.info)
+    return model
+
+
+# NEW: Read `use_gpu` from the custom_config of the Trainer.
+#      if it uses GPU, enable MirroredStrategy.
+def _get_distribution_strategy(fn_args: tfx.components.FnArgs):
+    if fn_args.custom_config.get(""use_gpu"", False):
+        logging.info(""Using MirroredStrategy with one GPU."")
+        return tf.distribute.MirroredStrategy(devices=[""device:GPU:0""])
+    return None
+
+
+# TFX Trainer will call this function.
+def run_fn(fn_args: tfx.components.FnArgs):
+    """"""Train the model based on given args.
+
+    Args:
+      fn_args: Holds args used to train the model as name/value pairs.
+    """"""
+
+    # This schema is usually either an output of SchemaGen or a manually-curated
+    # version provided by pipeline author. A schema can also derived from TFT
+    # graph if a Transform component is used. In the case when either is missing,
+    # `schema_from_feature_spec` could be used to generate schema from very simple
+    # feature_spec, but the schema returned would be very primitive.
+    schema = schema_utils.schema_from_feature_spec(_FEATURE_SPEC)
+    hyperparameters = fn_args.hyperparameters
+    logging.info(""Hyperparameters:"")
+    logging.info(hyperparameters)
+
+    train_dataset = _input_fn(
+        fn_args.train_files, fn_args.data_accessor, schema, batch_size=_TRAIN_BATCH_SIZE
+    )
+    eval_dataset = _input_fn(
+        fn_args.eval_files, fn_args.data_accessor, schema, batch_size=_EVAL_BATCH_SIZE
+    )
+
+    # NEW: If we have a distribution strategy, build a model in a strategy scope.
+    strategy = _get_distribution_strategy(fn_args)
+    if strategy is None:
+        model = _make_keras_model(hyperparameters[""learning_rate""])
+    else:
+        with strategy.scope():
+            model = _make_keras_model(hyperparameters[""learning_rate""])
+
+    model.fit(
+        train_dataset,
+        steps_per_epoch=fn_args.train_steps,
+        validation_data=eval_dataset,
+        validation_steps=fn_args.eval_steps,
+        epochs=hyperparameters[""num_epochs""],
+    )
+
+    # The result of the training should be saved in `fn_args.serving_model_dir`
+    # directory.
+    model.save(fn_args.serving_model_dir, save_format=""tf"")REPO_URL = ""https://github.com/sayakpaul/CI-CD-for-Model-Training""
+BRANCH = ""dev""
+
+PIPELINE_ROOT = ""gs://{}/pipeline_root/{}"".format(GCS_BUCKET_NAME, PIPELINE_NAME)
+
+SERVING_MODEL_DIR = ""gs://{}/serving_model/{}"".format(GCS_BUCKET_NAME, PIPELINE_NAME)
+
+VERSION = ""1.0.0""
+CICD_IMAGE_URI = f""gcr.io/tfx-oss-public/tfx:{VERSION}""
+TFX_IMAGE_URI = f""gcr.io/{GOOGLE_CLOUD_PROJECT}/{PIPELINE_NAME}:{VERSION}""SUBSTITUTIONS=f""""""\
+_REPO_URL='{REPO_URL}',\
+_BRANCH={BRANCH},\
+_PROJECT={GOOGLE_CLOUD_PROJECT},\
+_REGION={GOOGLE_CLOUD_REGION},\
+_PIPELINE_NAME={PIPELINE_NAME},\
+_PIPELINE_ROOT={PIPELINE_ROOT},\
+_MODULE_ROOT={MODULE_ROOT},\
+_DATA_ROOT={DATA_ROOT},\
+_SERVING_MODEL_DIR={SERVING_MODEL_DIR},\
+_CICD_IMAGE_URI={CICD_IMAGE_URI},\
+_TFX_IMAGE_URI={TFX_IMAGE_URI}
+""""""
+
+!echo $SUBSTITUTIONS"
+0,sayakpaul/CI-CD-for-Model-Training,cloud_function_trigger.ipynb,"from google.colab import auth
+auth.authenticate_user()GOOGLE_CLOUD_PROJECT = ""fast-ai-exploration""
+GOOGLE_CLOUD_REGION = ""us-central1""
+GCS_BUCKET_NAME = ""vertex-tfx-mlops""
+
+PIPELINE_NAME = ""penguin-vertex-training""
+PIPELINE_ROOT = ""gs://{}/pipeline_root/{}"".format(GCS_BUCKET_NAME, PIPELINE_NAME)
+PIPELINE_LOCATION = f""{PIPELINE_ROOT}/{PIPELINE_NAME}.json""
+PUBSUB_TOPIC = f""trigger-{PIPELINE_NAME}""
+
+DATA_ROOT = ""gs://{}/data/{}"".format(GCS_BUCKET_NAME, PIPELINE_NAME)
+MODULE_ROOT = ""gs://{}/pipeline_module/{}"".format(GCS_BUCKET_NAME, PIPELINE_NAME)
+
+if not (GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_REGION and GCS_BUCKET_NAME):
+    from absl import logging
+
+    logging.error(""Please set all required parameters."")ENV_VARS=f""""""\
+PROJECT={GOOGLE_CLOUD_PROJECT},\
+REGION={GOOGLE_CLOUD_REGION},\
+GCS_PIPELINE_FILE_LOCATION={PIPELINE_LOCATION}
+""""""
+
+!echo {ENV_VARS}BUCKET = f'gs://{GCS_BUCKET_NAME}'
+CLOUD_FUNCTION_NAME = f'trigger-{PIPELINE_NAME}-fn'
+
+!gcloud functions deploy {CLOUD_FUNCTION_NAME} \
+    --region={GOOGLE_CLOUD_REGION} \
+    --trigger-topic={PUBSUB_TOPIC} \
+    --runtime=python37 \
+    --source=cloud_function\
+    --entry-point=trigger_pipeline\
+    --stage-bucket={BUCKET}\
+    --update-env-vars={ENV_VARS}
+
+# `trigger_pipeline` is the name of the function inside
+# `cloud_function/main.py`import IPython
+
+cloud_fn_url = f""https://console.cloud.google.com/functions/details/{GOOGLE_CLOUD_REGION}/{CLOUD_FUNCTION_NAME}""
+html = (
+    f'See the Cloud Function details <a href=""{cloud_fn_url}"" target=""_blank"">here</a>.'
+)
+IPython.display.display(IPython.display.HTML(html))from google.cloud import pubsub
+import json
+
+publish_client = pubsub.PublisherClient()
+topic = f""projects/{GOOGLE_CLOUD_PROJECT}/topics/{PUBSUB_TOPIC}""
+data = {""num_epochs"": 3, ""learning_rate"": 1e-2}
+message = json.dumps(data)
+
+_ = publish_client.publish(topic, message.encode())"
+0,sayakpaul/CI-CD-for-Model-Training,cloud_scheduler_trigger.ipynb,"# only need if you are using Colab
+from google.colab import auth
+auth.authenticate_user()GOOGLE_CLOUD_PROJECT = ""gcp-ml-172005""
+GOOGLE_CLOUD_REGION = ""us-central1""
+
+PIPELINE_NAME = ""penguin-vertex-training""
+PUBSUB_TOPIC = f""trigger-{PIPELINE_NAME}""
+SCHEDULER_JOB_NAME = ""MLOpsJob""import json
+
+data = '{""num_epochs"": ""3"", ""learning_rate"": ""1e-2""}'
+data = json.dumps(data)import json
+from google.cloud import scheduler_v1
+from google.cloud.scheduler_v1.types.target import PubsubTarget
+from google.cloud.scheduler_v1.types.job import Job
+from google.cloud.scheduler_v1.types.cloudscheduler import CreateJobRequest
+
+client = scheduler_v1.CloudSchedulerClient.from_service_account_json(
+    r""./gcp-ml-172005-528977a75f85.json"")parent = client.common_location_path(GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_REGION)
+
+data = {""num_epochs"": ""3"", ""learning_rate"": ""1e-2""}
+data = json.dumps(data).encode('utf-8')
+pubsub_target = PubsubTarget(
+    topic_name=f""projects/{GOOGLE_CLOUD_PROJECT}/topics/{PUBSUB_TOPIC}"", 
+    data=data)
+
+job = Job(name=f""projects/{GOOGLE_CLOUD_PROJECT}/locations/{GOOGLE_CLOUD_REGION}/jobs/traing_for_model"", 
+          pubsub_target=pubsub_target, 
+          schedule=""*/3 * * * *"")
+
+req = CreateJobRequest(parent=parent, job=job)result_job = client.create_job(req)result_job"
+0,sayakpaul/CI-CD-for-Model-Training,build/compile_pipeline.py,"import argparse
+
+from absl import logging
+from create_pipeline import create_pipeline
+
+from tfx.orchestration import data_types
+from tfx.orchestration.kubeflow.v2 import kubeflow_v2_dag_runner
+
+import os
+import sys
+SCRIPT_DIR = os.path.dirname(
+    os.path.realpath(os.path.join(os.getcwd(), os.path.expanduser(__file__)))
+)
+sys.path.append(os.path.normpath(os.path.join(SCRIPT_DIR, "".."")))
+
+from utils import config
+
+
+def get_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        ""--use-gpu"",
+        type=str,
+        required=False,
+        default=""False""
+    )
+
+    return parser.parse_args()
+
+
+def compile_pipeline(args):
+    pipeline_definition_file = config.PIPELINE_NAME + "".json""
+
+    runner = kubeflow_v2_dag_runner.KubeflowV2DagRunner(
+        config=kubeflow_v2_dag_runner.KubeflowV2DagRunnerConfig(
+                default_image=config.TFX_IMAGE_URI
+            ),
+        output_filename=pipeline_definition_file,
+    )
+
+    use_gpu = True if args.use_gpu == ""True"" else False
+
+    return runner.run(
+        create_pipeline(
+            num_epochs=data_types.RuntimeParameter(name=""num_epochs"", ptype=int),
+            learning_rate=data_types.RuntimeParameter(name=""learning_rate"", ptype=float),
+            use_gpu=use_gpu,
+        ),
+        write_out=True,
+    )
+
+
+def main():
+    args = get_args()
+    result = compile_pipeline(args)
+    logging.info(result)
+
+
+if __name__ == ""__main__"":
+    main()
+"
+0,sayakpaul/CI-CD-for-Model-Training,build/create_pipeline.py,"from tfx.orchestration import data_types
+from tfx import v1 as tfx
+
+import os
+import sys
+SCRIPT_DIR = os.path.dirname(
+    os.path.realpath(os.path.join(os.getcwd(), os.path.expanduser(__file__)))
+)
+sys.path.append(os.path.normpath(os.path.join(SCRIPT_DIR, "".."")))
+
+from utils import config, custom_components
+
+def create_pipeline(
+    num_epochs: data_types.RuntimeParameter,
+    learning_rate: data_types.RuntimeParameter,
+    use_gpu: bool,
+) -> tfx.dsl.Pipeline:
+    """"""Implements the penguin pipeline with TFX.""""""
+    # Brings data into the pipeline or otherwise joins/converts training data.
+    example_gen = tfx.components.CsvExampleGen(input_base=config.DATA_ROOT)
+
+    # Generate hyperparameters.
+    hyperparams_gen = custom_components.hyperparameters_gen(
+        num_epochs=num_epochs,
+        learning_rate=learning_rate
+    ).with_id(""HyperparamsGen"")
+
+    # NEW: Configuration for Vertex AI Training.
+    # This dictionary will be passed as `CustomJobSpec`.
+    vertex_job_spec = {
+        ""project"": config.GCP_PROJECT,
+        ""worker_pool_specs"": [
+            {
+                ""machine_spec"": {
+                    ""machine_type"": ""n1-standard-4"",
+                },
+                ""replica_count"": 1,
+                ""container_spec"": {
+                    ""image_uri"": ""gcr.io/tfx-oss-public/tfx:{}"".format(tfx.__version__),
+                },
+            }
+        ],
+    }
+    if use_gpu:
+        # See https://cloud.google.com/vertex-ai/docs/reference/rest/v1/MachineSpec#acceleratortype
+        # for available machine types.
+        vertex_job_spec[""worker_pool_specs""][0][""machine_spec""].update(
+            {""accelerator_type"": ""NVIDIA_TESLA_K80"", ""accelerator_count"": 1}
+        )
+
+    # Trains a model using Vertex AI Training.
+    # NEW: We need to specify a Trainer for GCP with related configs.
+    trainer = tfx.extensions.google_cloud_ai_platform.Trainer(
+        module_file=config.MODULE_FILE,
+        examples=example_gen.outputs[""examples""],
+        train_args=tfx.proto.TrainArgs(num_steps=100),
+        eval_args=tfx.proto.EvalArgs(num_steps=5),
+        hyperparameters=hyperparams_gen.outputs[""hyperparameters""],
+        custom_config={
+            tfx.extensions.google_cloud_ai_platform.ENABLE_UCAIP_KEY: True,
+            tfx.extensions.google_cloud_ai_platform.UCAIP_REGION_KEY: config.GCP_REGION,
+            tfx.extensions.google_cloud_ai_platform.TRAINING_ARGS_KEY: vertex_job_spec,
+            ""use_gpu"": use_gpu,
+        },
+    )
+
+    # Pushes the model to a filesystem destination.
+    pusher = tfx.components.Pusher(
+        model=trainer.outputs[""model""],
+        push_destination=tfx.proto.PushDestination(
+            filesystem=tfx.proto.PushDestination.Filesystem(
+                base_directory=config.SERVING_MODEL_DIR
+            )
+        ),
+    )
+
+    components = [
+        example_gen,
+        hyperparams_gen,
+        trainer,
+        pusher,
+    ]
+
+    return tfx.dsl.Pipeline(
+        pipeline_name=config.PIPELINE_NAME, pipeline_root=config.PIPELINE_ROOT, components=components
+    )
+"
+0,sayakpaul/CI-CD-for-Model-Training,build/penguin_trainer.py,"# Copied from https://www.tensorflow.org/tfx/tutorials/tfx/penguin_simple and
+# slightly modified run_fn() to add distribution_strategy.
+
+from typing import List
+from absl import logging
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow_metadata.proto.v0 import schema_pb2
+from tensorflow_transform.tf_metadata import schema_utils
+
+from tfx import v1 as tfx
+from tfx_bsl.public import tfxio
+
+_FEATURE_KEYS = [
+    ""culmen_length_mm"",
+    ""culmen_depth_mm"",
+    ""flipper_length_mm"",
+    ""body_mass_g"",
+]
+_LABEL_KEY = ""species""
+
+_TRAIN_BATCH_SIZE = 20
+_EVAL_BATCH_SIZE = 10
+
+# Since we're not generating or creating a schema, we will instead create
+# a feature spec.  Since there are a fairly small number of features this is
+# manageable for this dataset.
+_FEATURE_SPEC = {
+    **{
+        feature: tf.io.FixedLenFeature(shape=[1], dtype=tf.float32)
+        for feature in _FEATURE_KEYS
+    },
+    _LABEL_KEY: tf.io.FixedLenFeature(shape=[1], dtype=tf.int64),
+}
+
+
+def _input_fn(
+    file_pattern: List[str],
+    data_accessor: tfx.components.DataAccessor,
+    schema: schema_pb2.Schema,
+    batch_size: int,
+) -> tf.data.Dataset:
+    """"""Generates features and label for training.
+
+    Args:
+      file_pattern: List of paths or patterns of input tfrecord files.
+      data_accessor: DataAccessor for converting input to RecordBatch.
+      schema: schema of the input data.
+      batch_size: representing the number of consecutive elements of returned
+        dataset to combine in a single batch
+
+    Returns:
+      A dataset that contains (features, indices) tuple where features is a
+        dictionary of Tensors, and indices is a single Tensor of label indices.
+    """"""
+    return data_accessor.tf_dataset_factory(
+        file_pattern,
+        tfxio.TensorFlowDatasetOptions(batch_size=batch_size, label_key=_LABEL_KEY),
+        schema=schema
+    ).repeat()
+
+
+def _make_keras_model(learning_rate: float) -> tf.keras.Model:
+    """"""Creates a DNN Keras model for classifying penguin data.
+
+    Returns:
+      A Keras Model.
+    """"""
+    # The model below is built with Functional API, please refer to
+    # https://www.tensorflow.org/guide/keras/overview for all API options.
+    inputs = [keras.layers.Input(shape=(1,), name=f) for f in _FEATURE_KEYS]
+    d = keras.layers.concatenate(inputs)
+    for _ in range(2):
+        d = keras.layers.Dense(8, activation=""relu"")(d)
+    outputs = keras.layers.Dense(3)(d)
+
+    model = keras.Model(inputs=inputs, outputs=outputs)
+    optimizer = keras.optimizers.Adam(learning_rate)
+    model.compile(
+        optimizer=optimizer,
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=[keras.metrics.SparseCategoricalAccuracy()],
+    )
+
+    model.summary(print_fn=logging.info)
+    return model
+
+
+# NEW: Read `use_gpu` from the custom_config of the Trainer.
+#      if it uses GPU, enable MirroredStrategy.
+def _get_distribution_strategy(fn_args: tfx.components.FnArgs):
+    if fn_args.custom_config.get(""use_gpu"", False):
+        logging.info(""Using MirroredStrategy with one GPU."")
+        return tf.distribute.MirroredStrategy(devices=[""device:GPU:0""])
+    return None
+
+
+# TFX Trainer will call this function.
+def run_fn(fn_args: tfx.components.FnArgs):
+    """"""Train the model based on given args.
+
+    Args:
+      fn_args: Holds args used to train the model as name/value pairs.
+    """"""
+
+    # This schema is usually either an output of SchemaGen or a manually-curated
+    # version provided by pipeline author. A schema can also derived from TFT
+    # graph if a Transform component is used. In the case when either is missing,
+    # `schema_from_feature_spec` could be used to generate schema from very simple
+    # feature_spec, but the schema returned would be very primitive.
+    schema = schema_utils.schema_from_feature_spec(_FEATURE_SPEC)
+    hyperparameters = fn_args.hyperparameters
+    logging.info(""Hyperparameters:"")
+    logging.info(hyperparameters)
+
+    train_dataset = _input_fn(
+        fn_args.train_files, fn_args.data_accessor, schema, batch_size=_TRAIN_BATCH_SIZE
+    )
+    eval_dataset = _input_fn(
+        fn_args.eval_files, fn_args.data_accessor, schema, batch_size=_EVAL_BATCH_SIZE
+    )
+
+    # NEW: If we have a distribution strategy, build a model in a strategy scope.
+    strategy = _get_distribution_strategy(fn_args)
+    if strategy is None:
+        model = _make_keras_model(hyperparameters[""learning_rate""])
+    else:
+        with strategy.scope():
+            model = _make_keras_model(hyperparameters[""learning_rate""])
+
+    model.fit(
+        train_dataset,
+        steps_per_epoch=fn_args.train_steps,
+        validation_data=eval_dataset,
+        validation_steps=fn_args.eval_steps,
+        epochs=hyperparameters[""num_epochs""],
+    )
+
+    # The result of the training should be saved in `fn_args.serving_model_dir`
+    # directory.
+    model.save(fn_args.serving_model_dir, save_format=""tf"")
+"
+0,sayakpaul/CI-CD-for-Model-Training,cloud_function/main.py,"# Copyright 2021 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the ""License"");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an ""AS IS"" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+""""""Cloud Function to be triggered by Pub/Sub.""""""
+
+import os
+import json
+import logging
+import base64
+
+from kfp.v2.google.client import AIPlatformClient
+from google.cloud import storage
+
+
+def trigger_pipeline(event, context):
+    # Parse the environment variables.
+    project = os.getenv(""PROJECT"")
+    region = os.getenv(""REGION"")
+    gcs_pipeline_file_location = os.getenv(""GCS_PIPELINE_FILE_LOCATION"")
+    
+    if not project:
+        raise ValueError(""Environment variable GCP_PROJECT is not set."")
+    if not region:
+        raise ValueError(""Environment variable GCP_REGION is not set."")
+    if not gcs_pipeline_file_location:
+        raise ValueError(""Environment variable GCS_PIPELINE_FILE_LOCATION is not set."")
+    
+    # Check if the pipeline file exists in the provided GCS Bucket.
+    storage_client = storage.Client()
+
+    if not gcs_pipeline_file_location:
+        raise ValueError(""Environment variable GCS_PIPELINE_FILE_LOCATION is not set."")
+
+    path_parts = gcs_pipeline_file_location.replace(""gs://"", """").split(""/"")
+    bucket_name = path_parts[0]
+    blob_name = ""/"".join(path_parts[1:])
+
+    bucket = storage_client.bucket(bucket_name)
+    blob = storage.Blob(bucket=bucket, name=blob_name)
+
+    if not blob.exists(storage_client):
+        raise ValueError(f""{gcs_pipeline_file_location} does not exist."")
+    
+    # Parse the data from the Pub/Sub trigger message.
+    data = base64.b64decode(event[""data""]).decode(""utf-8"")
+    logging.info(f""Event data: {data}"")
+
+    parameter_values = json.loads(data)
+    
+    # Initialize Vertex AI API client and submit for pipeline execution.
+    api_client = AIPlatformClient(project_id=project, region=region)
+
+    response = api_client.create_run_from_job_spec(
+        job_spec_path=gcs_pipeline_file_location,
+        parameter_values=parameter_values,
+        enable_caching=True,
+    )
+
+    logging.info(response)
+"
+0,sayakpaul/CI-CD-for-Model-Training,utils/config.py,"import os
+
+# GCP
+GCP_PROJECT = os.getenv(""PROJECT"")
+GCP_REGION = os.getenv(""REGION"")
+
+# Data
+DATA_ROOT = os.getenv(""DATA_ROOT"")
+
+# Training and serving
+TFX_IMAGE_URI = os.getenv(""TFX_IMAGE_URI"")
+MODULE_ROOT = os.getenv(""MODULE_ROOT"")
+MODULE_FILE = os.path.join(MODULE_ROOT, ""penguin_trainer.py"")
+SERVING_MODEL_DIR = os.getenv(""MODULE_ROOT"")
+
+# Pipeline
+PIPELINE_NAME = os.getenv(""PIPELINE_NAME"")
+PIPELINE_ROOT = os.getenv(""SERVING_MODEL_DIR"")
+"
+0,sayakpaul/CI-CD-for-Model-Training,utils/custom_components.py,"""""""
+Taken from:
+    * https://github.com/GoogleCloudPlatform/mlops-with-vertex-ai/blob/main/src/tfx_pipelines/components.py#L51
+""""""
+
+from tfx.dsl.component.experimental.decorators import component
+from tfx.dsl.component.experimental.annotations import (
+    InputArtifact,
+    OutputArtifact,
+    Parameter,
+)
+from tfx.types.standard_artifacts import HyperParameters
+from tfx.types import artifact_utils
+from tfx.utils import io_utils
+import logging
+import json
+import os
+
+
+@component
+def hyperparameters_gen(
+    num_epochs: Parameter[int],
+    learning_rate: Parameter[float],
+    hyperparameters: OutputArtifact[HyperParameters],
+):
+
+    hp_dict = dict()
+    hp_dict[""num_epochs""] = num_epochs
+    hp_dict[""learning_rate""] = learning_rate
+    logging.info(f""Hyperparameters: {hp_dict}"")
+
+    hyperparams_uri = os.path.join(
+        artifact_utils.get_single_uri([hyperparameters]), ""hyperparameters.json""
+    )
+    io_utils.write_string_file(hyperparams_uri, json.dumps(hp_dict))
+    logging.info(f""Hyperparameters are written to: {hyperparams_uri}"")
+"
+0,sayakpaul/Dual-Deployments-on-Vertex-AI,custom_components/firebase_publisher.py,"""""""
+Custom TFX component for Firebase upload.
+Author: Chansung Park
+""""""
+
+from tfx import types
+from tfx.dsl.component.experimental.decorators import component
+from tfx.dsl.component.experimental.annotations import Parameter
+from tfx import v1 as tfx
+from absl import logging
+
+import firebase_admin
+from firebase_admin import ml
+from firebase_admin import storage
+from firebase_admin import credentials
+from google.cloud import storage as gcs_storage
+
+
+@component
+def FirebasePublisher(
+    pushed_model: tfx.dsl.components.InputArtifact[
+        tfx.types.standard_artifacts.PushedModel
+    ],
+    credential_uri: Parameter[str],
+    firebase_dest_gcs_bucket: Parameter[str],
+    model_display_name: Parameter[str],
+    model_tag: Parameter[str],
+) -> tfx.dsl.components.OutputDict(result=str):
+    """"""
+    publish trained tflite model to Firebase ML, this component assumes that 
+    trained model and Firebase credential files are stored in GCS locations.
+    
+    Args:   
+        pushed_model: The URI of pushed model obtained from previous component (i.e. Pusher)
+        credential_uri: The URI of Firebase credential. In order to get one, go to Firebase dashboard 
+            and on the Settings page, create a service account and download the service account key file. 
+            Keep this file safe, since it grants administrator access to your project.
+        firebase_dest_gcs_bucket: GCS bucket where the model is going to be temporarily stored.
+            In order to create one, go to Firebase dashboard and on the Storage page, enable Cloud Storage. 
+            Take note of your bucket name.
+        model_display_name: The name to be appeared on Firebase ML dashboard
+        model_tag: The tage name to be appeared on Firebase ML dashboard
+    """"""
+    
+    model_uri = f""{pushed_model.uri}/model.tflite""
+    
+    assert model_uri.split(""://"")[0] == ""gs""
+    assert credential_uri.split(""://"")[0] == ""gs""
+
+    # create gcs client instance
+    gcs_client = gcs_storage.Client()
+
+    # get credential for firebase
+    credential_gcs_bucket = credential_uri.split(""//"")[1].split(""/"")[0]
+    credential_blob_path = ""/"".join(credential_uri.split(""//"")[1].split(""/"")[1:])
+
+    bucket = gcs_client.bucket(credential_gcs_bucket)
+    blob = bucket.blob(credential_blob_path)
+    blob.download_to_filename(""credential.json"")
+    logging.info(f""download credential.json from {credential_uri} is completed"")
+
+    # get tflite model file
+    tflite_gcs_bucket = model_uri.split(""//"")[1].split(""/"")[0]
+    tflite_blob_path = ""/"".join(model_uri.split(""//"")[1].split(""/"")[1:])
+
+    bucket = gcs_client.bucket(tflite_gcs_bucket)
+    blob = bucket.blob(tflite_blob_path)
+    blob.download_to_filename(""model.tflite"")
+    logging.info(f""download model.tflite from {model_uri} is completed"")
+
+    firebase_admin.initialize_app(
+        credentials.Certificate(""credential.json""),
+        options={""storageBucket"": firebase_dest_gcs_bucket},
+    )
+    logging.info(""firebase_admin initialize app is completed"")
+
+    model_list = ml.list_models(list_filter=f""display_name={model_display_name}"")
+    # update
+    if len(model_list.models) > 0:
+        # get the first match model
+        model = model_list.models[0]
+        source = ml.TFLiteGCSModelSource.from_tflite_model_file(""model.tflite"")
+        model.model_format = ml.TFLiteFormat(model_source=source)
+
+        updated_model = ml.update_model(model)
+        ml.publish_model(updated_model.model_id)
+
+        logging.info(""model exists, so update it in FireBase ML"")
+        return {""result"": ""model updated""}
+    # create
+    else:
+        # load a tflite file and upload it to Cloud Storage
+        source = ml.TFLiteGCSModelSource.from_tflite_model_file(""model.tflite"")
+
+        # create the model object
+        tflite_format = ml.TFLiteFormat(model_source=source)
+        model = ml.Model(
+            display_name=model_display_name,
+            tags=[model_tag],
+            model_format=tflite_format,
+        )
+
+        # Add the model to your Firebase project and publish it
+        new_model = ml.create_model(model)
+        ml.publish_model(new_model.model_id)
+
+        logging.info(""model doesn exists, so create one in FireBase ML"")
+        return {""result"": ""model created""}
+"
+0,sayakpaul/Dual-Deployments-on-Vertex-AI,custom_components/flower_densenet_trainer.py,"from typing import List
+from absl import logging
+from tensorflow import keras
+from tfx import v1 as tfx
+import tensorflow as tf
+
+
+_IMAGE_FEATURES = {
+    ""image"": tf.io.FixedLenFeature([], tf.string),
+    ""class"": tf.io.FixedLenFeature([], tf.int64),
+    ""one_hot_class"": tf.io.VarLenFeature(tf.float32),
+}
+
+_CONCRETE_INPUT = ""numpy_inputs""
+_INPUT_SHAPE = (224, 224, 3)
+_TRAIN_BATCH_SIZE = 64
+_EVAL_BATCH_SIZE = 64
+_EPOCHS = 2
+
+
+def _parse_fn(example):
+    example = tf.io.parse_single_example(example, _IMAGE_FEATURES)
+    image = tf.image.decode_jpeg(example[""image""], channels=3)
+    class_label = tf.cast(example[""class""], tf.int32)
+    return image, class_label
+
+
+def _input_fn(file_pattern: List[str], batch_size: int) -> tf.data.Dataset:
+    """"""Generates features and label for training.
+
+    Args:
+        file_pattern: List of paths or patterns of input tfrecord files.
+        batch_size: representing the number of consecutive elements of returned
+            dataset to combine in a single batch.
+
+    Returns:
+        A dataset that contains (features, indices) tuple where features is a
+            dictionary of Tensors, and indices is a single Tensor of label indices.
+    """"""
+    logging.info(f""Reading data from: {file_pattern}"")
+    tfrecord_filenames = tf.io.gfile.glob(file_pattern[0] + "".gz"")
+    dataset = tf.data.TFRecordDataset(tfrecord_filenames, compression_type=""GZIP"")
+    dataset = dataset.map(_parse_fn).batch(batch_size)
+    return dataset.repeat()
+
+
+def _make_keras_model() -> tf.keras.Model:
+    """"""Creates a DenseNet121-based model for classifying flowers data.
+
+    Returns:
+    A Keras Model.
+    """"""
+    inputs = keras.Input(shape=_INPUT_SHAPE)
+    base_model = keras.applications.DenseNet121(
+        include_top=False, input_shape=_INPUT_SHAPE, pooling=""avg""
+    )
+    base_model.trainable = False
+    x = keras.applications.densenet.preprocess_input(inputs)
+    x = base_model(
+        x, training=False
+    )  # Ensures BatchNorm runs in inference model in this model
+    outputs = keras.layers.Dense(5, activation=""softmax"")(x)
+    model = keras.Model(inputs, outputs)
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+        metrics=[keras.metrics.SparseCategoricalAccuracy()],
+    )
+
+    model.summary(print_fn=logging.info)
+    return model
+
+
+def _preprocess(bytes_input):
+    decoded = tf.io.decode_jpeg(bytes_input, channels=3)
+    resized = tf.image.resize(decoded, size=(224, 224))
+    return resized
+
+
+@tf.function(input_signature=[tf.TensorSpec([None], tf.string)])
+def preprocess_fn(bytes_inputs):
+    decoded_images = tf.map_fn(
+        _preprocess, bytes_inputs, dtype=tf.float32, back_prop=False
+    )
+    return {_CONCRETE_INPUT: decoded_images}
+
+
+def _model_exporter(model: tf.keras.Model):
+    m_call = tf.function(model.call).get_concrete_function(
+        [
+            tf.TensorSpec(
+                shape=[None, 224, 224, 3], dtype=tf.float32, name=_CONCRETE_INPUT
+            )
+        ]
+    )
+
+    @tf.function(input_signature=[tf.TensorSpec([None], tf.string)])
+    def serving_fn(bytes_inputs):
+        # This function comes from the Computer Vision book from O'Reilly.
+        labels = tf.constant(
+            [""daisy"", ""dandelion"", ""roses"", ""sunflowers"", ""tulips""], dtype=tf.string
+        )
+        images = preprocess_fn(bytes_inputs)
+
+        probs = m_call(**images)
+        indices = tf.argmax(probs, axis=1)
+        pred_source = tf.gather(params=labels, indices=indices)
+        pred_confidence = tf.reduce_max(probs, axis=1)
+        return {""label"": pred_source, ""confidence"": pred_confidence}
+
+    return serving_fn
+
+
+# TFX Trainer will call this function.
+def run_fn(fn_args: tfx.components.FnArgs):
+    """"""Train the model based on given args.
+
+    Args:
+        fn_args: Holds args used to train the model as name/value pairs.
+    """"""
+    train_dataset = _input_fn(fn_args.train_files, batch_size=_TRAIN_BATCH_SIZE)
+    eval_dataset = _input_fn(fn_args.eval_files, batch_size=_EVAL_BATCH_SIZE)
+
+    model = _make_keras_model()
+    model.fit(
+        train_dataset,
+        steps_per_epoch=fn_args.train_steps,
+        validation_data=eval_dataset,
+        validation_steps=fn_args.eval_steps,
+        epochs=_EPOCHS,
+    )
+    _, acc = model.evaluate(eval_dataset, steps=fn_args.eval_steps)
+    logging.info(f""Validation accuracy: {round(acc * 100, 2)}%"")
+    # The result of the training should be saved in `fn_args.serving_model_dir`
+    # directory.
+    tf.saved_model.save(
+        model,
+        fn_args.serving_model_dir,
+        signatures={""serving_default"": _model_exporter(model)},
+    )
+"
+0,sayakpaul/Dual-Deployments-on-Vertex-AI,custom_components/flower_mobilenet_trainer.py,"from typing import List
+from absl import logging
+from tensorflow import keras
+from tfx import v1 as tfx
+import tensorflow as tf
+
+
+_IMAGE_FEATURES = {
+    ""image"": tf.io.FixedLenFeature([], tf.string),
+    ""class"": tf.io.FixedLenFeature([], tf.int64),
+    ""one_hot_class"": tf.io.VarLenFeature(tf.float32),
+}
+
+_INPUT_SHAPE = (224, 224, 3)
+_TRAIN_BATCH_SIZE = 64
+_EVAL_BATCH_SIZE = 64
+_EPOCHS = 2
+
+
+def _parse_fn(example):
+    example = tf.io.parse_single_example(example, _IMAGE_FEATURES)
+    image = tf.image.decode_jpeg(example[""image""], channels=3)
+    class_label = tf.cast(example[""class""], tf.int32)
+    return image, class_label
+
+
+def _input_fn(file_pattern: List[str], batch_size: int) -> tf.data.Dataset:
+    """"""Generates features and label for training.
+
+    Args:
+        file_pattern: List of paths or patterns of input tfrecord files.
+        batch_size: representing the number of consecutive elements of returned
+            dataset to combine in a single batch.
+
+    Returns:
+        A dataset that contains (features, indices) tuple where features is a
+            dictionary of Tensors, and indices is a single Tensor of label indices.
+    """"""
+    logging.info(f""Reading data from: {file_pattern}"")
+    tfrecord_filenames = tf.io.gfile.glob(file_pattern[0] + "".gz"")
+    dataset = tf.data.TFRecordDataset(tfrecord_filenames, compression_type=""GZIP"")
+    dataset = dataset.map(_parse_fn).batch(batch_size)
+    return dataset.repeat()
+
+
+def _make_keras_model() -> tf.keras.Model:
+    """"""Creates a MobileNetV3-based model for classifying flowers data.
+
+    Returns:
+    A Keras Model.
+    """"""
+    inputs = keras.Input(shape=_INPUT_SHAPE)
+    base_model = keras.applications.MobileNetV3Small(
+        include_top=False, input_shape=_INPUT_SHAPE, pooling=""avg""
+    )
+    base_model.trainable = False
+    x = keras.applications.mobilenet_v3.preprocess_input(inputs)
+    x = base_model(
+        x, training=False
+    )  # Ensures BatchNorm runs in inference model in this model
+    outputs = keras.layers.Dense(5, activation=""softmax"")(x)
+    model = keras.Model(inputs, outputs)
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+        metrics=[keras.metrics.SparseCategoricalAccuracy()],
+    )
+
+    model.summary(print_fn=logging.info)
+    return model
+
+
+# TFX Trainer will call this function.
+def run_fn(fn_args: tfx.components.FnArgs):
+    """"""Train the model based on given args.
+
+    Args:
+        fn_args: Holds args used to train the model as name/value pairs.
+    """"""
+    train_dataset = _input_fn(fn_args.train_files, batch_size=_TRAIN_BATCH_SIZE)
+    eval_dataset = _input_fn(fn_args.eval_files, batch_size=_EVAL_BATCH_SIZE)
+
+    model = _make_keras_model()
+    model.fit(
+        train_dataset,
+        steps_per_epoch=fn_args.train_steps,
+        validation_data=eval_dataset,
+        validation_steps=fn_args.eval_steps,
+        epochs=_EPOCHS,
+    )
+    _, acc = model.evaluate(eval_dataset, steps=fn_args.eval_steps)
+    logging.info(f""Validation accuracy: {round(acc * 100, 2)}%"")
+
+    # Convert the model.
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    tflite_model = converter.convert()
+
+    # Save the model.
+    # The result of the training should be saved in `fn_args.serving_model_dir` directory.
+    with tf.io.gfile.GFile(fn_args.serving_model_dir + ""/model.tflite"", ""wb"") as f:
+        f.write(tflite_model)
+"
+0,sayakpaul/Dual-Deployments-on-Vertex-AI,custom_components/vertex_deployer.py,"""""""
+Custom TFX component for deploying a model to a Vertex AI Endpoint.
+Author: Sayak Paul
+Reference: https://github.com/GoogleCloudPlatform/mlops-with-vertex-ai/blob/main/build/utils.py#L97
+""""""
+
+from tfx.dsl.component.experimental.decorators import component
+from tfx.dsl.component.experimental.annotations import Parameter
+from tfx.types.standard_artifacts import String
+from google.cloud import aiplatform as vertex_ai
+from tfx import v1 as tfx
+from absl import logging
+
+
+@component
+def VertexDeployer(
+    project: Parameter[str],
+    region: Parameter[str],
+    model_display_name: Parameter[str],
+    deployed_model_display_name: Parameter[str],
+):
+
+    logging.info(f""Endpoint display: {deployed_model_display_name}"")
+    vertex_ai.init(project=project, location=region)
+
+    endpoints = vertex_ai.Endpoint.list(
+        filter=f""display_name={deployed_model_display_name}"", order_by=""update_time""
+    )
+
+    if len(endpoints) > 0:
+        logging.info(f""Endpoint {deployed_model_display_name} already exists."")
+        endpoint = endpoints[-1]
+    else:
+        endpoint = vertex_ai.Endpoint.create(deployed_model_display_name)
+
+    model = vertex_ai.Model.list(
+        filter=f""display_name={model_display_name}"", order_by=""update_time""
+    )[-1]
+
+    endpoint = vertex_ai.Endpoint.list(
+        filter=f""display_name={deployed_model_display_name}"", order_by=""update_time""
+    )[-1]
+
+    deployed_model = endpoint.deploy(
+        model=model,
+        # Syntax from here: https://git.io/JBQDP
+        traffic_split={""0"": 100},
+        machine_type=""n1-standard-4"",
+        min_replica_count=1,
+        max_replica_count=1,
+    )
+
+    logging.info(f""Model deployed to: {deployed_model}"")
+"
+0,sayakpaul/Dual-Deployments-on-Vertex-AI,custom_components/vertex_uploader.py,"""""""
+Custom TFX component for importing a model into Vertex AI.
+Author: Sayak Paul
+Reference: https://github.com/GoogleCloudPlatform/mlops-with-vertex-ai/blob/main/src/tfx_pipelines/components.py#L74
+""""""
+
+import os
+import tensorflow as tf
+
+from tfx.dsl.component.experimental.decorators import component
+from tfx.dsl.component.experimental.annotations import Parameter
+from tfx.types.standard_artifacts import String
+from google.cloud import aiplatform as vertex_ai
+from tfx import v1 as tfx
+from absl import logging
+
+
+@component
+def VertexUploader(
+    project: Parameter[str],
+    region: Parameter[str],
+    model_display_name: Parameter[str],
+    pushed_model_location: Parameter[str],
+    serving_image_uri: Parameter[str],
+    uploaded_model: tfx.dsl.components.OutputArtifact[String],
+):
+
+    vertex_ai.init(project=project, location=region)
+
+    pushed_model_dir = os.path.join(
+        pushed_model_location, tf.io.gfile.listdir(pushed_model_location)[-1]
+    )
+
+    logging.info(f""Model registry location: {pushed_model_dir}"")
+
+    vertex_model = vertex_ai.Model.upload(
+        display_name=model_display_name,
+        artifact_uri=pushed_model_dir,
+        serving_container_image_uri=serving_image_uri,
+        parameters_schema_uri=None,
+        instance_schema_uri=None,
+        explanation_metadata=None,
+        explanation_parameters=None,
+    )
+
+    uploaded_model.set_string_custom_property(
+        ""model_resource_name"", str(vertex_model.resource_name)
+    )
+    logging.info(f""Model resource: {str(vertex_model.resource_name)}"")
+"
+0,sayakpaul/Dual-Deployments-on-Vertex-AI,notebooks/Custom_Model_TFX.ipynb,"from google.colab import auth
+auth.authenticate_user()import tensorflow as tf
+print('TensorFlow version: {}'.format(tf.__version__))
+from tfx import v1 as tfx
+print('TFX version: {}'.format(tfx.__version__))
+import kfp
+print('KFP version: {}'.format(kfp.__version__))
+
+from google.cloud import aiplatform as vertex_ai
+import osGOOGLE_CLOUD_PROJECT = 'fast-ai-exploration'    #@param {type:""string""}
+GOOGLE_CLOUD_REGION = 'us-central1'             #@param {type:""string""}
+GCS_BUCKET_NAME = 'vertex-tfx-mlops'            #@param {type:""string""}
+
+if not (GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_REGION and GCS_BUCKET_NAME):
+    from absl import logging
+    logging.error('Please set all required parameters.')PIPELINE_NAME = 'two-way-vertex-pipelines5'
+
+# Path to various pipeline artifact.
+PIPELINE_ROOT = 'gs://{}/pipeline_root/{}'.format(
+    GCS_BUCKET_NAME, PIPELINE_NAME)
+
+# Paths for users' Python module.
+MODULE_ROOT = 'gs://{}/pipeline_module/{}'.format(
+    GCS_BUCKET_NAME, PIPELINE_NAME)
+
+# Paths for input data.
+DATA_ROOT = 'gs://flowers-public/tfrecords-jpeg-224x224'
+
+# This is the path where your model will be pushed for serving.
+SERVING_MODEL_DIR = 'gs://{}/serving_model/{}'.format(
+    GCS_BUCKET_NAME, PIPELINE_NAME)
+
+print('PIPELINE_ROOT: {}'.format(PIPELINE_ROOT))FIREBASE_CREDENTIAL_PATH = 'gs://credential-csp/gcp-ml-172005-firebase-adminsdk-5gdtb-38c6644f1e.json'
+FIREBASE_GCS_BUCKET = 'gcp-ml-172005.appspot.com'_trainer_densenet_module_file = 'flower_densenet_trainer.py'
+_trainer_mobilenet_module_file = 'flower_mobilenet_trainer.py'%%writefile {_trainer_densenet_module_file}
+
+from typing import List
+from absl import logging
+from tensorflow import keras
+from tfx import v1 as tfx
+import tensorflow as tf
+
+
+_IMAGE_FEATURES = {
+    ""image"": tf.io.FixedLenFeature([], tf.string),
+    ""class"": tf.io.FixedLenFeature([], tf.int64),
+    ""one_hot_class"": tf.io.VarLenFeature(tf.float32),
+}
+
+_CONCRETE_INPUT = ""numpy_inputs""
+_INPUT_SHAPE = (224, 224, 3)
+_TRAIN_BATCH_SIZE = 64
+_EVAL_BATCH_SIZE = 64
+_EPOCHS = 2
+
+
+def _parse_fn(example):
+    example = tf.io.parse_single_example(example, _IMAGE_FEATURES)
+    image = tf.image.decode_jpeg(example[""image""], channels=3)
+    class_label = tf.cast(example[""class""], tf.int32)
+    return image, class_label
+
+
+def _input_fn(file_pattern: List[str], batch_size: int) -> tf.data.Dataset:
+    """"""Generates features and label for training.
+
+    Args:
+        file_pattern: List of paths or patterns of input tfrecord files.
+        batch_size: representing the number of consecutive elements of returned
+            dataset to combine in a single batch.
+
+    Returns:
+        A dataset that contains (features, indices) tuple where features is a
+            dictionary of Tensors, and indices is a single Tensor of label indices.
+    """"""
+    logging.info(f""Reading data from: {file_pattern}"")
+    tfrecord_filenames = tf.io.gfile.glob(file_pattern[0] + "".gz"")
+    dataset = tf.data.TFRecordDataset(tfrecord_filenames, compression_type=""GZIP"")
+    dataset = dataset.map(_parse_fn).batch(batch_size)
+    return dataset.repeat()
+
+
+def _make_keras_model() -> tf.keras.Model:
+    """"""Creates a DenseNet121-based model for classifying flowers data.
+
+    Returns:
+    A Keras Model.
+    """"""
+    inputs = keras.Input(shape=_INPUT_SHAPE)
+    base_model = keras.applications.DenseNet121(
+        include_top=False, input_shape=_INPUT_SHAPE, pooling=""avg""
+    )
+    base_model.trainable = False
+    x = keras.applications.densenet.preprocess_input(inputs)
+    x = base_model(
+        x, training=False
+    )  # Ensures BatchNorm runs in inference model in this model
+    outputs = keras.layers.Dense(5, activation=""softmax"")(x)
+    model = keras.Model(inputs, outputs)
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+        metrics=[keras.metrics.SparseCategoricalAccuracy()],
+    )
+
+    model.summary(print_fn=logging.info)
+    return model
+
+
+def _preprocess(bytes_input):
+    decoded = tf.io.decode_jpeg(bytes_input, channels=3)
+    resized = tf.image.resize(decoded, size=(224, 224))
+    return resized
+
+
+@tf.function(input_signature=[tf.TensorSpec([None], tf.string)])
+def preprocess_fn(bytes_inputs):
+    decoded_images = tf.map_fn(
+        _preprocess, bytes_inputs, dtype=tf.float32, back_prop=False
+    )
+    return {_CONCRETE_INPUT: decoded_images}
+
+
+def _model_exporter(model: tf.keras.Model):
+    m_call = tf.function(model.call).get_concrete_function(
+        [
+            tf.TensorSpec(
+                shape=[None, 224, 224, 3], dtype=tf.float32, name=_CONCRETE_INPUT
+            )
+        ]
+    )
+
+    @tf.function(input_signature=[tf.TensorSpec([None], tf.string)])
+    def serving_fn(bytes_inputs):
+        labels = tf.constant(
+            [""daisy"", ""dandelion"", ""roses"", ""sunflowers"", ""tulips""], dtype=tf.string
+        )
+        images = preprocess_fn(bytes_inputs)
+
+        probs = m_call(**images)
+        indices = tf.argmax(probs, axis=1)
+        pred_source = tf.gather(params=labels, indices=indices)
+        pred_confidence = tf.reduce_max(probs, axis=1)
+        return {""label"": pred_source, ""confidence"": pred_confidence}
+
+    return serving_fn
+
+
+# TFX Trainer will call this function.
+def run_fn(fn_args: tfx.components.FnArgs):
+    """"""Train the model based on given args.
+
+    Args:
+        fn_args: Holds args used to train the model as name/value pairs.
+    """"""
+    train_dataset = _input_fn(fn_args.train_files, batch_size=_TRAIN_BATCH_SIZE)
+    eval_dataset = _input_fn(fn_args.eval_files, batch_size=_EVAL_BATCH_SIZE)
+
+    model = _make_keras_model()
+    model.fit(
+        train_dataset,
+        steps_per_epoch=fn_args.train_steps,
+        validation_data=eval_dataset,
+        validation_steps=fn_args.eval_steps,
+        epochs=_EPOCHS,
+    )
+    _, acc = model.evaluate(eval_dataset, steps=fn_args.eval_steps)
+    logging.info(f""Validation accuracy: {round(acc * 100, 2)}%"")
+    # The result of the training should be saved in `fn_args.serving_model_dir`
+    # directory.
+    tf.saved_model.save(
+        model,
+        fn_args.serving_model_dir,
+        signatures={""serving_default"": _model_exporter(model)},
+    )
+%%writefile {_trainer_mobilenet_module_file}
+
+from typing import List
+from absl import logging
+from tensorflow import keras
+from tfx import v1 as tfx
+import tensorflow as tf
+
+
+_IMAGE_FEATURES = {
+    ""image"": tf.io.FixedLenFeature([], tf.string),
+    ""class"": tf.io.FixedLenFeature([], tf.int64),
+    ""one_hot_class"": tf.io.VarLenFeature(tf.float32),
+}
+
+_INPUT_SHAPE = (224, 224, 3)
+_TRAIN_BATCH_SIZE = 64
+_EVAL_BATCH_SIZE = 64
+_EPOCHS = 2
+
+
+def _parse_fn(example):
+    example = tf.io.parse_single_example(example, _IMAGE_FEATURES)
+    image = tf.image.decode_jpeg(example[""image""], channels=3)
+    class_label = tf.cast(example[""class""], tf.int32)
+    return image, class_label
+
+
+def _input_fn(file_pattern: List[str], batch_size: int) -> tf.data.Dataset:
+    """"""Generates features and label for training.
+
+    Args:
+        file_pattern: List of paths or patterns of input tfrecord files.
+        batch_size: representing the number of consecutive elements of returned
+            dataset to combine in a single batch.
+
+    Returns:
+        A dataset that contains (features, indices) tuple where features is a
+            dictionary of Tensors, and indices is a single Tensor of label indices.
+    """"""
+    logging.info(f""Reading data from: {file_pattern}"")
+    tfrecord_filenames = tf.io.gfile.glob(file_pattern[0] + "".gz"")
+    dataset = tf.data.TFRecordDataset(tfrecord_filenames, compression_type=""GZIP"")
+    dataset = dataset.map(_parse_fn).batch(batch_size)
+    return dataset.repeat()
+
+
+def _make_keras_model() -> tf.keras.Model:
+    """"""Creates a MobileNetV3-based model for classifying flowers data.
+
+    Returns:
+    A Keras Model.
+    """"""
+    inputs = keras.Input(shape=_INPUT_SHAPE)
+    base_model = keras.applications.MobileNetV3Small(
+        include_top=False, input_shape=_INPUT_SHAPE, pooling=""avg""
+    )
+    base_model.trainable = False
+    x = keras.applications.mobilenet_v3.preprocess_input(inputs)
+    x = base_model(
+        x, training=False
+    )  # Ensures BatchNorm runs in inference model in this model
+    outputs = keras.layers.Dense(5, activation=""softmax"")(x)
+    model = keras.Model(inputs, outputs)
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+        metrics=[keras.metrics.SparseCategoricalAccuracy()],
+    )
+
+    model.summary(print_fn=logging.info)
+    return model
+
+
+# TFX Trainer will call this function.
+def run_fn(fn_args: tfx.components.FnArgs):
+    """"""Train the model based on given args.
+
+    Args:
+        fn_args: Holds args used to train the model as name/value pairs.
+    """"""
+    train_dataset = _input_fn(fn_args.train_files, batch_size=_TRAIN_BATCH_SIZE)
+    eval_dataset = _input_fn(fn_args.eval_files, batch_size=_EVAL_BATCH_SIZE)
+
+    model = _make_keras_model()
+    model.fit(
+        train_dataset,
+        steps_per_epoch=fn_args.train_steps,
+        validation_data=eval_dataset,
+        validation_steps=fn_args.eval_steps,
+        epochs=_EPOCHS,
+    )
+    _, acc = model.evaluate(eval_dataset, steps=fn_args.eval_steps)
+    logging.info(f""Validation accuracy: {round(acc * 100, 2)}%"")
+
+    # Convert the model.
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    tflite_model = converter.convert()
+
+    # Save the model.
+    # The result of the training should be saved in `fn_args.serving_model_dir` directory.
+    with tf.io.gfile.GFile(fn_args.serving_model_dir + ""/model.tflite"", ""wb"") as f:
+        f.write(tflite_model)
+_vertex_uploader_module_file = 'vertex_uploader.py'
+_vertex_deployer_module_file = 'vertex_deployer.py'
+_firebase_publisher_module_file = 'firebase_publisher.py'%%writefile {_vertex_uploader_module_file}
+
+import os
+import tensorflow as tf
+
+from tfx.dsl.component.experimental.decorators import component
+from tfx.dsl.component.experimental.annotations import Parameter
+from tfx.types.standard_artifacts import String
+from google.cloud import aiplatform as vertex_ai
+from tfx import v1 as tfx
+from absl import logging
+
+
+@component
+def VertexUploader(
+    project: Parameter[str],
+    region: Parameter[str],
+    model_display_name: Parameter[str],
+    pushed_model_location: Parameter[str],
+    serving_image_uri: Parameter[str],
+    uploaded_model: tfx.dsl.components.OutputArtifact[String],
+):
+
+    vertex_ai.init(project=project, location=region)
+
+    pushed_model_dir = os.path.join(
+        pushed_model_location, tf.io.gfile.listdir(pushed_model_location)[-1]
+    )
+
+    logging.info(f""Model registry location: {pushed_model_dir}"")
+
+    vertex_model = vertex_ai.Model.upload(
+        display_name=model_display_name,
+        artifact_uri=pushed_model_dir,
+        serving_container_image_uri=serving_image_uri,
+        parameters_schema_uri=None,
+        instance_schema_uri=None,
+        explanation_metadata=None,
+        explanation_parameters=None,
+    )
+
+    uploaded_model.set_string_custom_property(
+        ""model_resource_name"", str(vertex_model.resource_name)
+    )
+    logging.info(f""Model resource: {str(vertex_model.resource_name)}"")
+%%writefile {_vertex_deployer_module_file}
+
+from tfx.dsl.component.experimental.decorators import component
+from tfx.dsl.component.experimental.annotations import Parameter
+from tfx.types.standard_artifacts import String
+from google.cloud import aiplatform as vertex_ai
+from tfx import v1 as tfx
+from absl import logging
+
+
+@component
+def VertexDeployer(
+    project: Parameter[str],
+    region: Parameter[str],
+    model_display_name: Parameter[str],
+    deployed_model_display_name: Parameter[str],
+):
+
+    logging.info(f""Endpoint display: {deployed_model_display_name}"")
+    vertex_ai.init(project=project, location=region)
+
+    endpoints = vertex_ai.Endpoint.list(
+        filter=f""display_name={deployed_model_display_name}"", order_by=""update_time""
+    )
+
+    if len(endpoints) > 0:
+        logging.info(f""Endpoint {deployed_model_display_name} already exists."")
+        endpoint = endpoints[-1]
+    else:
+        endpoint = vertex_ai.Endpoint.create(deployed_model_display_name)
+
+    model = vertex_ai.Model.list(
+        filter=f""display_name={model_display_name}"", order_by=""update_time""
+    )[-1]
+
+    endpoint = vertex_ai.Endpoint.list(
+        filter=f""display_name={deployed_model_display_name}"", order_by=""update_time""
+    )[-1]
+
+    deployed_model = endpoint.deploy(
+        model=model,
+        # Syntax from here: https://git.io/JBQDP
+        traffic_split={""0"": 100},
+        machine_type=""n1-standard-4"",
+        min_replica_count=1,
+        max_replica_count=1,
+    )
+
+    logging.info(f""Model deployed to: {deployed_model}"")
+%%writefile {_firebase_publisher_module_file}
+
+from tfx import types
+from tfx.dsl.component.experimental.decorators import component
+from tfx.dsl.component.experimental.annotations import Parameter
+from tfx import v1 as tfx
+from absl import logging
+
+import firebase_admin
+from firebase_admin import ml
+from firebase_admin import storage
+from firebase_admin import credentials
+from google.cloud import storage as gcs_storage
+
+
+@component
+def FirebasePublisher(
+    pushed_model: tfx.dsl.components.InputArtifact[
+        tfx.types.standard_artifacts.PushedModel
+    ],
+    credential_uri: Parameter[str],
+    firebase_dest_gcs_bucket: Parameter[str],
+    model_display_name: Parameter[str],
+    model_tag: Parameter[str],
+) -> tfx.dsl.components.OutputDict(result=str):
+    model_uri = f""{pushed_model.uri}/model.tflite""
+
+    assert model_uri.split(""://"")[0] == ""gs""
+    assert credential_uri.split(""://"")[0] == ""gs""
+
+    # create gcs client instance
+    gcs_client = gcs_storage.Client()
+
+    # get credential for firebase
+    credential_gcs_bucket = credential_uri.split(""//"")[1].split(""/"")[0]
+    credential_blob_path = ""/"".join(credential_uri.split(""//"")[1].split(""/"")[1:])
+
+    bucket = gcs_client.bucket(credential_gcs_bucket)
+    blob = bucket.blob(credential_blob_path)
+    blob.download_to_filename(""credential.json"")
+    logging.info(f""download credential.json from {credential_uri} is completed"")
+
+    # get tflite model file
+    tflite_gcs_bucket = model_uri.split(""//"")[1].split(""/"")[0]
+    tflite_blob_path = ""/"".join(model_uri.split(""//"")[1].split(""/"")[1:])
+
+    bucket = gcs_client.bucket(tflite_gcs_bucket)
+    blob = bucket.blob(tflite_blob_path)
+    blob.download_to_filename(""model.tflite"")
+    logging.info(f""download model.tflite from {model_uri} is completed"")
+
+    firebase_admin.initialize_app(
+        credentials.Certificate(""credential.json""),
+        options={""storageBucket"": firebase_dest_gcs_bucket},
+    )
+    logging.info(""firebase_admin initialize app is completed"")
+
+    model_list = ml.list_models(list_filter=f""display_name={model_display_name}"")
+    # update
+    if len(model_list.models) > 0:
+        # get the first match model
+        model = model_list.models[0]
+        source = ml.TFLiteGCSModelSource.from_tflite_model_file(""model.tflite"")
+        model.model_format = ml.TFLiteFormat(model_source=source)
+
+        updated_model = ml.update_model(model)
+        ml.publish_model(updated_model.model_id)
+
+        logging.info(""model exists, so update it in FireBase ML"")
+        return {""result"": ""model updated""}
+    # create
+    else:
+        # load a tflite file and upload it to Cloud Storage
+        source = ml.TFLiteGCSModelSource.from_tflite_model_file(""model.tflite"")
+
+        # create the model object
+        tflite_format = ml.TFLiteFormat(model_source=source)
+        model = ml.Model(
+            display_name=model_display_name,
+            tags=[model_tag],
+            model_format=tflite_format,
+        )
+
+        # Add the model to your Firebase project and publish it
+        new_model = ml.create_model(model)
+        ml.publish_model(new_model.model_id)
+
+        logging.info(""model doesn exists, so create one in FireBase ML"")
+        return {""result"": ""model created""}
+DATASET_DISPLAY_NAME = ""flowers""
+VERSION = ""tfx-1-0-0""
+TFX_IMAGE_URI = f""gcr.io/{GOOGLE_CLOUD_PROJECT}/{DATASET_DISPLAY_NAME}:{VERSION}""
+print(f""URI of the custom image: {TFX_IMAGE_URI}"")%%writefile Dockerfile
+
+FROM gcr.io/tfx-oss-public/tfx:1.0.0
+RUN mkdir -p custom_components
+COPY custom_components/* ./custom_components/
+RUN pip install --upgrade google-cloud-aiplatform google-cloud-storage firebase-admin# Specify training worker configurations. To minimize costs we can even specify two
+# different configurations: a beefier machine for the Endpoint model and slightly less
+# powerful machine for the mobile model.
+TRAINING_JOB_SPEC = {
+    'project': GOOGLE_CLOUD_PROJECT,
+    'worker_pool_specs': [{
+        'machine_spec': {
+            'machine_type': 'n1-standard-4',
+            'accelerator_type': 'NVIDIA_TESLA_K80',
+            'accelerator_count': 1
+        },
+        'replica_count': 1,
+        'container_spec': {
+            'image_uri': 'gcr.io/tfx-oss-public/tfx:{}'.format(tfx.__version__),
+        },
+    }],
+}from datetime import datetime
+
+TIMESTAMP = datetime.now().strftime(""%Y%m%d%H%M%S"")from custom_components.vertex_uploader import VertexUploader
+from custom_components.vertex_deployer import VertexDeployer
+from custom_components.firebase_publisher import FirebasePublisher
+
+
+def _create_pipeline(
+    pipeline_name: str,
+    pipeline_root: str,
+    data_root: str,
+    densenet_module_file: str,
+    mobilenet_module_file: str,
+    serving_model_dir: str,
+    firebase_crediential_path: str,
+    firebase_gcs_bucket: str,
+    project_id: str,
+    region: str,
+) -> tfx.dsl.Pipeline:
+    """"""Creates a three component flowers pipeline with TFX.""""""
+    # Brings data into the pipeline.
+    # input_base: gs://flowers-public/tfrecords-jpeg-224x224
+    example_gen = tfx.components.ImportExampleGen(input_base=data_root)
+
+    # Uses user-provided Python function that trains a model.
+    densenet_trainer = tfx.extensions.google_cloud_ai_platform.Trainer(
+        module_file=densenet_module_file,
+        examples=example_gen.outputs[""examples""],
+        train_args=tfx.proto.TrainArgs(num_steps=52),
+        eval_args=tfx.proto.EvalArgs(num_steps=5),
+        custom_config={
+            tfx.extensions.google_cloud_ai_platform.ENABLE_UCAIP_KEY: True,
+            tfx.extensions.google_cloud_ai_platform.UCAIP_REGION_KEY: region,
+            tfx.extensions.google_cloud_ai_platform.TRAINING_ARGS_KEY: TRAINING_JOB_SPEC,
+            ""use_gpu"": True,
+        },
+    ).with_id(""densenet_trainer"")
+
+    # Pushes the model to a filesystem destination.
+    pushed_model_location = os.path.join(serving_model_dir, ""densenet"")
+    densnet_pusher = tfx.components.Pusher(
+        model=densenet_trainer.outputs[""model""],
+        push_destination=tfx.proto.PushDestination(
+            filesystem=tfx.proto.PushDestination.Filesystem(
+                base_directory=pushed_model_location
+            )
+        ),
+    ).with_id(""densnet_pusher"")
+
+    # Vertex AI upload.
+    model_display_name = ""densenet_flowers_latest""
+    uploader = VertexUploader(
+        project=project_id,
+        region=region,
+        model_display_name=model_display_name,
+        pushed_model_location=pushed_model_location,
+        serving_image_uri=""us-docker.pkg.dev/vertex-ai/prediction/tf2-cpu.2-5:latest"",
+    ).with_id(""vertex_uploader"")
+    uploader.add_upstream_node(densnet_pusher)
+
+    # Create an endpoint.
+    deployer = VertexDeployer(
+        project=project_id,
+        region=region,
+        model_display_name=model_display_name,
+        deployed_model_display_name=model_display_name + ""_"" + TIMESTAMP,
+    ).with_id(""vertex_deployer"")
+    deployer.add_upstream_node(uploader)
+
+    # We repeat the steps for the MobileNet model too but this time we won't
+    # be creating an Endpoint. We will first convert the Keras model to TFLite
+    # and then push it to Firebase for better operability. 
+    mobilenet_trainer = tfx.extensions.google_cloud_ai_platform.Trainer(
+        module_file=mobilenet_module_file,
+        examples=example_gen.outputs[""examples""],
+        train_args=tfx.proto.TrainArgs(num_steps=52),
+        eval_args=tfx.proto.EvalArgs(num_steps=5),
+        custom_config={
+            tfx.extensions.google_cloud_ai_platform.ENABLE_UCAIP_KEY: True,
+            tfx.extensions.google_cloud_ai_platform.UCAIP_REGION_KEY: region,
+            tfx.extensions.google_cloud_ai_platform.TRAINING_ARGS_KEY: TRAINING_JOB_SPEC,
+            ""use_gpu"": True,
+        },
+    ).with_id(""mobilenet_trainer"")
+
+    pushed_location_mobilenet = os.path.join(serving_model_dir, ""mobilenet"")
+    mobilenet_pusher = tfx.components.Pusher(
+        model=mobilenet_trainer.outputs[""model""],
+        push_destination=tfx.proto.PushDestination(
+            filesystem=tfx.proto.PushDestination.Filesystem(
+                base_directory=pushed_location_mobilenet
+            )
+        ),
+    ).with_id(""mobilenet_pusher"")
+
+    firebase_publisher = FirebasePublisher(
+        pushed_model=mobilenet_pusher.outputs[""pushed_model""],
+        credential_uri=firebase_crediential_path,
+        firebase_dest_gcs_bucket=firebase_gcs_bucket,
+        model_display_name=model_display_name,
+        model_tag=""mobilenet"",
+    ).with_id(""firebase_publisher"")
+
+    # Following components will be included in the pipeline.
+    components = [
+        example_gen,
+        densenet_trainer,
+        densnet_pusher,
+        uploader,
+        deployer,
+        mobilenet_trainer,
+        mobilenet_pusher,
+        firebase_publisher,
+    ]
+
+    return tfx.dsl.Pipeline(
+        pipeline_name=pipeline_name, pipeline_root=pipeline_root, components=components
+    )
+PIPELINE_DEFINITION_FILE = PIPELINE_NAME + '_pipeline.json'
+
+# Important: We need to pass the custom Docker image URI to the
+# `KubeflowV2DagRunnerConfig` to take effect.
+runner = tfx.orchestration.experimental.KubeflowV2DagRunner(
+    config=tfx.orchestration.experimental.KubeflowV2DagRunnerConfig(default_image=TFX_IMAGE_URI),
+    output_filename=PIPELINE_DEFINITION_FILE)
+
+_ = runner.run(
+    _create_pipeline(
+        pipeline_name=PIPELINE_NAME,
+        pipeline_root=PIPELINE_ROOT,
+        data_root=DATA_ROOT,
+        densenet_module_file=os.path.join(MODULE_ROOT, _trainer_densenet_module_file),
+        mobilenet_module_file=os.path.join(MODULE_ROOT, _trainer_mobilenet_module_file),
+        serving_model_dir=SERVING_MODEL_DIR,
+        firebase_crediential_path=FIREBASE_CREDENTIAL_PATH,
+        firebase_gcs_bucket=FIREBASE_GCS_BUCKET, 
+        project_id=GOOGLE_CLOUD_PROJECT,
+        region=GOOGLE_CLOUD_REGION
+    )
+)from kfp.v2.google import client
+
+pipelines_client = client.AIPlatformClient(
+    project_id=GOOGLE_CLOUD_PROJECT,
+    region=GOOGLE_CLOUD_REGION,
+)
+
+_ = pipelines_client.create_run_from_job_spec(PIPELINE_DEFINITION_FILE, enable_caching=True)from google.cloud.aiplatform import gapic as aip
+from google.protobuf import json_format
+from google.protobuf.json_format import MessageToJson, ParseDict
+from google.protobuf.struct_pb2 import Struct, Value
+
+import base64vertex_ai.init(project=GOOGLE_CLOUD_PROJECT, location=GOOGLE_CLOUD_REGION)model_display_name = ""densenet_flowers_latest""
+deployed_model_display_name = model_display_name + ""_"" + TIMESTAMP
+
+endpoint = vertex_ai.Endpoint.list(
+    filter=f'display_name={deployed_model_display_name}',
+    order_by=""update_time""
+)[-1]
+
+endpoint_id = endpoint.name
+endpoint_idimage_path = tf.keras.utils.get_file(""image.jpg"", 
+                                            ""https://m.economictimes.com/thumb/msid-71307470,width-1201,height-900,resizemode-4,imgsize-1040796/roses.jpg"")
+bytes = tf.io.read_file(image_path)
+b64str = base64.b64encode(bytes.numpy()).decode(""utf-8"")pushed_model_location = os.path.join(SERVING_MODEL_DIR, ""densenet"")
+model_path_to_deploy = os.path.join(
+    pushed_model_location, tf.io.gfile.listdir(pushed_model_location)[-1]
+)
+
+loaded = tf.saved_model.load(model_path_to_deploy)
+serving_input = list(
+    loaded.signatures[""serving_default""].structured_input_signature[1].keys()
+)[0]
+print(""Serving function input:"", serving_input)def predict_image(image, endpoint, parameters_dict):
+    # The format of each instance should conform to the deployed model's prediction input schema.
+    instances_list = [{serving_input: {""b64"": image}}]
+    instances = [json_format.ParseDict(s, Value()) for s in instances_list]
+
+    endpoint = vertex_ai.Endpoint(endpoint)
+    print(endpoint.predict(instances=instances))
+
+predict_image(b64str, endpoint_id, None)"
+0,sayakpaul/Dual-Deployments-on-Vertex-AI,notebooks/Dataset_Prep.ipynb,"#@title GCS
+#@markdown You should change these values as per your preferences. The copy operation can take ~5 minutes. 
+BUCKET_PATH = ""gs://flowers-experimental"" #@param {type:""string""}
+REGION = ""us-central1"" #@param {type:""string""}
+
+!gsutil mb -l {REGION} {BUCKET_PATH}
+!gsutil -m cp -r flower_photos {BUCKET_PATH}import random
+random.seed(666)
+
+from google.cloud import storage
+from pprint import pprint
+import pandas as pd
+import osfrom google.colab import auth
+auth.authenticate_user()gs_uris = []
+
+storage_client = storage.Client(project=""fast-ai-exploration"") # Change it accordingly.
+blobs = storage_client.list_blobs(BUCKET_PATH.split(""/"")[-1])
+
+for blob in blobs:
+    if "".txt"" in blob.name.split(""/"")[-1]:
+        continue
+    gs_uri = os.path.join(BUCKET_PATH, blob.name)
+    gs_uris.append(gs_uri)
+
+pprint(gs_uris[:5])# Create splits.
+random.shuffle(gs_uris)
+
+i = int(len(gs_uris) * 0.9)
+train_paths = gs_uris[:i]
+test_paths = gs_uris[i:]
+
+i = int(len(train_paths) * 0.05)
+valid_paths = train_paths[:i]
+train_paths = train_paths[i:]
+
+print(len(train_paths), len(valid_paths), len(test_paths))def derive_labels(gcs_paths, split=""training""):
+    labels = []
+    for gcs_path in gcs_paths:
+        label = gcs_path.split(""/"")[4]
+        labels.append(label)
+    return labels, [split] * len(gcs_paths)# File format is referred from: https://cloud.google.com/vertex-ai/docs/datasets/prepare-image#csv
+train_labels, train_use = derive_labels(train_paths)
+val_labels, val_use = derive_labels(valid_paths, split=""validation"")
+test_labels, test_use= derive_labels(test_paths, split=""test"")gcs_uris = []
+labels = []
+use = []
+
+gcs_uris.extend(train_paths)
+gcs_uris.extend(valid_paths)
+gcs_uris.extend(test_paths)
+
+labels.extend(train_labels)
+labels.extend(val_labels)
+labels.extend(test_labels)
+
+use.extend(train_use)
+use.extend(val_use)
+use.extend(test_use)import csv
+
+with open(""flowers_vertex.csv"", ""w"") as csvfile: 
+    csvwriter = csv.writer(csvfile)
+    
+    for ml_use, gcs_uri, label in zip(use, gcs_uris, labels):
+        row = [ml_use, gcs_uri, label]
+        csvwriter.writerow(row)  "
+0,sayakpaul/Dual-Deployments-on-Vertex-AI,notebooks/Dual_Deployments_With_AutoML.ipynb,"import os
+
+# The Google Cloud Notebook product has specific requirements
+IS_GOOGLE_CLOUD_NOTEBOOK = os.path.exists(""/opt/deeplearning/metadata/env_version"")
+
+# Google Cloud Notebook requires dependencies to be installed with '--user'
+USER_FLAG = """"
+if IS_GOOGLE_CLOUD_NOTEBOOK:
+    USER_FLAG = ""--user""# Automatically restart kernel after installs
+import os
+
+if not os.getenv(""IS_TESTING""):
+    # Automatically restart kernel after installs
+    import IPython
+
+    app = IPython.Application.instance()
+    app.kernel.do_shutdown(True)import os
+
+PROJECT_ID = ""grounded-atrium-320207""
+
+# Get your Google Cloud project ID from gcloud
+if not os.getenv(""IS_TESTING""):
+    shell_output=!gcloud config list --format 'value(core.project)' 2>/dev/null
+    PROJECT_ID = shell_output[0]
+    print(""Project ID: "", PROJECT_ID)import os
+import sys
+
+# If you are running this notebook in Colab, run this cell and follow the
+# instructions to authenticate your GCP account. This provides access to your
+# Cloud Storage bucket and lets you submit training jobs and prediction
+# requests.
+
+# The Google Cloud Notebook product has specific requirements
+IS_GOOGLE_CLOUD_NOTEBOOK = os.path.exists(""/opt/deeplearning/metadata/env_version"")
+
+# If on Google Cloud Notebooks, then don't execute this code
+if not IS_GOOGLE_CLOUD_NOTEBOOK:
+    if ""google.colab"" in sys.modules:
+        from google.colab import auth as google_auth
+
+        google_auth.authenticate_user()
+
+    # If you are running this notebook locally, replace the string below with the
+    # path to your service account key and run this cell to authenticate your GCP
+    # account.
+    elif not os.getenv(""IS_TESTING""):
+        %env GOOGLE_APPLICATION_CREDENTIALS ''BUCKET_NAME = ""gs://vertexai_dual_example""
+REGION      = ""us-central1""  PATH=%env PATH
+%env PATH={PATH}:/home/jupyter/.local/bin
+
+USER = ""chansung""
+PIPELINE_ROOT = ""{}/pipeline_root/{}"".format(BUCKET_NAME, USER)
+PIPELINE_ROOTimport kfp
+from google.cloud import aiplatform
+from google_cloud_pipeline_components import aiplatform as gcc_aip
+from kfp.v2 import compiler
+from kfp.v2.google.client import AIPlatformClient
+from kfp.v2 import dsl
+from kfp.v2.dsl import component@component(
+    packages_to_install=[""google-cloud-storage"", ""firebase-admin"", ""tensorflow""]
+)
+def push_to_firebase(
+    credential_uri: str,
+    model_bucket: str,
+    firebase_dest_gcs_bucket: str,
+    model_display_name: str,
+    model_tag: str
+):
+    import firebase_admin
+    from firebase_admin import ml
+    from firebase_admin import storage
+    from firebase_admin import credentials    
+    from google.cloud import storage as gcs_storage
+    
+    gcs_client = gcs_storage.Client()
+    
+    # get credential for firebase  
+    credential_gcs_bucket = credential_uri.split('//')[1].split('/')[0]
+    credential_blob_path = '/'.join(credential_uri.split('//')[1].split('/')[1:])
+    
+    bucket = gcs_client.bucket(credential_gcs_bucket)
+    blob = bucket.blob(credential_blob_path)
+    blob.download_to_filename('credential.json')
+    
+    # get the latest model    
+    tflite_blobs = gcs_client.get_bucket(model_bucket).list_blobs()
+    tflite_blob = sorted(tflite_blobs, reverse=True, key=lambda blob: blob.name.split('/')[-2])[0]
+    tflite_blob.download_to_filename('model.tflite')            
+            
+    firebase_admin.initialize_app(
+        credentials.Certificate('credential.json'),
+        options={
+            'storageBucket': firebase_dest_gcs_bucket
+        }
+    )
+
+    model_list = ml.list_models(list_filter=f'display_name={model_display_name}')
+    # update
+    if len(model_list.models) > 0:
+        # get the first match model
+        model = model_list.models[0]
+        
+        source = ml.TFLiteGCSModelSource.from_tflite_model_file('model.tflite')
+        model.model_format = ml.TFLiteFormat(model_source=source)
+        
+        updated_model = ml.update_model(model)
+        ml.publish_model(updated_model.model_id)
+    # create
+    else:    
+        # Load a tflite file and upload it to Cloud Storage
+        source = ml.TFLiteGCSModelSource.from_tflite_model_file('model.tflite')
+
+        # Create the model object
+        tflite_format = ml.TFLiteFormat(model_source=source)
+        model = ml.Model(
+            display_name=model_display_name,  # This is the name you use from your app to load the model.
+            tags=[model_tag],             # Optional tags for easier management.
+            model_format=tflite_format)
+
+        # Add the model to your Firebase project and publish it
+        new_model = ml.create_model(model)
+        ml.publish_model(new_model.model_id)@kfp.dsl.pipeline(name=""cloud-mobile-dual-deployment"")
+def pipeline(project: str = PROJECT_ID):
+    ds_op = gcc_aip.ImageDatasetCreateOp(
+       project=project,
+       display_name=""flowers-dataset"",
+       gcs_source=""gs://dataset-meta-gde-csp/flowers_vertex.csv"",
+       import_schema_uri=aiplatform.schema.dataset.ioformat.image.multi_label_classification,
+    )
+
+    configs = [
+       {
+          ""type"": ""CLOUD"",
+          ""model_type"": ""CLOUD"",
+          ""display_name"": ""train-cloud-model"",
+          ""model_display_name"": ""cloud-model"",
+          ""budget_milli_node_hours"": 8000,
+       },
+       {
+          ""type"": ""MOBILE"",
+          ""model_type"": ""MOBILE_TF_VERSATILE_1"",
+          ""display_name"": ""train-mobile-model"",
+          ""model_display_name"": ""mobile-model"",
+          ""budget_milli_node_hours"": 1000,
+       }
+    ]
+
+    with kfp.dsl.ParallelFor(configs) as config:
+        training_job_run_op = gcc_aip.AutoMLImageTrainingJobRunOp(
+            project=project,
+            display_name=config.display_name,
+            prediction_type=""classification"",
+            multi_label=True,
+            model_type=config.model_type,
+            base_model=None,
+            dataset=ds_op.outputs[""dataset""],
+            model_display_name=config.model_display_name,
+            budget_milli_node_hours=config.budget_milli_node_hours,
+        )
+        training_job_run_op.after(ds_op)
+
+        with kfp.dsl.Condition(config.type=='CLOUD'):
+            endpoint_op = gcc_aip.ModelDeployOp(
+                project=project,
+                model=training_job_run_op.outputs[""model""]
+            )
+            endpoint_op.after(training_job_run_op)
+            
+        with kfp.dsl.Condition(config.type=='MOBILE'):
+            export_op = gcc_aip.ModelExportOp( 
+                project=project,
+                model=training_job_run_op.outputs[""model""],
+                # tflite, edgetpu-tflite, tf-saved-model, tf-js, core-ml, custom-trained
+                export_format_id=""tflite"",
+                artifact_destination=""gs://output-model-gde-csp/flower-models/""
+            )
+            export_op.after(training_job_run_op)
+
+            credential_uri=""gs://firebase-ml-bucket-gde-csp/grounded-atrium-320207-firebase-adminsdk-5n9sn-20dbda9947.json""
+            model_bucket=""output-model-gde-csp""
+            firebase_bucket=""grounded-atrium-320207.appspot.com""
+            
+            firebase_op = push_to_firebase(
+                ins=export_op.outputs['exported_dataset'],
+                credential_uri=credential_uri,
+                model_bucket=model_bucket,
+                firebase_dest_gcs_bucket=firebase_bucket,
+                model_display_name=""custom_model"",
+                model_tag=""from_dual_deployment""
+            )
+            firebase_op.after(export_op)
+                    from kfp.v2 import compiler
+
+compiler.Compiler().compile(
+    pipeline_func=pipeline, package_path=""cloud-mobile-dual-deployment.json""
+)from kfp.v2.google.client import AIPlatformClient
+
+api_client = AIPlatformClient(project_id=PROJECT_ID, region=REGION)response = api_client.create_run_from_job_spec(
+    ""cloud-mobile-dual-deployment.json"",
+    pipeline_root=PIPELINE_ROOT,
+    parameter_values={""project"": PROJECT_ID},
+)"
+0,sayakpaul/Dual-Deployments-on-Vertex-AI,notebooks/Model_Tests.ipynb,"from io import BytesIO
+from PIL import Image
+import matplotlib.pyplot as plt
+import numpy as np
+import requests
+import base64
+
+from google.cloud.aiplatform.gapic.schema import predict
+from google.cloud import aiplatform
+import tensorflow as tfdef preprocess_image(image):
+    """"""Preprocesses an image.""""""
+    image = np.array(image)
+    image = tf.image.resize(image, (224, 224))
+    image = tf.cast(image, tf.uint8)
+    return image[None, ...]
+
+def load_image_from_url(url):
+    """"""Loads an image from a URL. Please provide a URL of a valid RGB image.""""""
+    response = requests.get(url)
+    image = Image.open(BytesIO(response.content))
+    image = preprocess_image(image)
+    return image
+
+def tflite_inference(tflite_model_path, image):
+    """"""Runs inference with a TFLite model.""""""
+    # Load the TFLite model from its patth and allocate tensors into memory.
+    interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
+    interpreter.allocate_tensors()
+
+    # Get the indices of input and output of the model.
+    input_details = interpreter.get_input_details()[0]
+    input_index = input_details[""index""]
+    output_index = interpreter.get_output_details()[0][""index""]
+
+    # Scale if needed. 
+    if input_details[""dtype""] == np.uint8:
+        input_scale, input_zero_point = input_details[""quantization""]
+        image = tf.cast(image, tf.float32)
+        image = image / input_scale + input_zero_point
+        image = tf.cast(image, tf.uint8)
+
+    # Run inference.
+    interpreter.set_tensor(input_index, image)
+    interpreter.invoke()
+
+    # Post-processing: remove batch dimension and find the digit with highest
+    # probability.
+    probability = interpreter.get_tensor(output_index)
+    flower_id = np.argmax(probability[0])
+    return flower_idimage = load_image_from_url(""https://m.economictimes.com/thumb/msid-71307470,width-1201,height-900,resizemode-4,imgsize-1040796/roses.jpg"")
+plt.imshow(image[0])
+plt.axis(""off"")
+plt.show()tflite_model_path = tf.keras.utils.get_file(""model.tflite"", 
+                                            ""https://storage.googleapis.com/output-model-gde-csp/flower-models/model-8119506343032782848/tflite/2021-07-28T15%3A48%3A15.623623Z/model.tflite"")CLASSES = [""daisy"", ""dandelion"", ""roses"", ""sunflowers"", ""tulips""]
+CLASSES[tflite_inference(tflite_model_path, image)]from google.colab import auth
+auth.authenticate_user()# Reference:
+# https://cloud.google.com/vertex-ai/docs/predictions/online-predictions-automl
+def predict_image_classification_sample(
+    project: str,
+    endpoint_id: str,
+    filename: str,
+    location: str = ""us-central1"",
+    api_endpoint: str = ""us-central1-aiplatform.googleapis.com"",
+):
+    # The AI Platform services require regional API endpoints.
+    client_options = {""api_endpoint"": api_endpoint}
+    # Initialize client that will be used to create and send requests.
+    # This client only needs to be created once, and can be reused for multiple requests.
+    client = aiplatform.gapic.PredictionServiceClient(client_options=client_options)
+    with open(filename, ""rb"") as f:
+        file_content = f.read()
+
+    # The format of each instance should conform to the deployed model's prediction input schema.
+    encoded_content = base64.b64encode(file_content).decode(""utf-8"")
+    instance = predict.instance.ImageClassificationPredictionInstance(
+        content=encoded_content,
+    ).to_value()
+    instances = [instance]
+    # See gs://google-cloud-aiplatform/schema/predict/params/image_classification_1.0.0.yaml for the format of the parameters.
+    parameters = predict.params.ImageClassificationPredictionParams(
+        confidence_threshold=0.5, max_predictions=5,
+    ).to_value()
+    endpoint = client.endpoint_path(
+        project=project, location=location, endpoint=endpoint_id
+    )
+    response = client.predict(
+        endpoint=endpoint, instances=instances, parameters=parameters
+    )
+    print(""response"")
+    print("" deployed_model_id:"", response.deployed_model_id)
+    # See gs://google-cloud-aiplatform/schema/predict/prediction/classification.yaml for the format of the predictions.
+    predictions = response.predictions
+    for prediction in predictions:
+        print("" prediction:"", dict(prediction))
+image_path = tf.keras.utils.get_file(""image.jpg"", 
+                                            ""https://m.economictimes.com/thumb/msid-71307470,width-1201,height-900,resizemode-4,imgsize-1040796/roses.jpg"")
+
+predict_image_classification_sample(
+    project=""881543627888"",
+    endpoint_id=""2892911849701900288"",
+    location=""us-central1"",
+    filename=image_path
+)"
